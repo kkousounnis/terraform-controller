@@ -6,7 +6,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/oam-dev/terraform-controller/controllers/configuration/backend"
 	"github.com/pkg/errors"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	apitypes "k8s.io/apimachinery/pkg/types"
@@ -50,25 +49,6 @@ func ValidConfigurationObject(configuration *v1beta2.Configuration) (types.Confi
 	return "", nil
 }
 
-// RenderConfiguration will compose the Terraform configuration with hcl/json and backend
-func RenderConfiguration(configuration *v1beta2.Configuration, k8sClient client.Client, configurationType types.ConfigurationType, credentials map[string]string) (string, backend.Backend, error) {
-	backendInterface, err := backend.ParseConfigurationBackend(configuration, k8sClient, credentials)
-	if err != nil {
-		return "", nil, errors.Wrap(err, "failed to prepare Terraform backend configuration")
-	}
-
-	switch configurationType {
-	case types.ConfigurationHCL:
-		completedConfiguration := configuration.Spec.HCL
-		completedConfiguration += "\n" + backendInterface.HCL()
-		return completedConfiguration, backendInterface, nil
-	case types.ConfigurationRemote:
-		return backendInterface.HCL(), backendInterface, nil
-	default:
-		return "", nil, errors.New("Unsupported Configuration Type")
-	}
-}
-
 // SetRegion will set the region for Configuration
 func SetRegion(ctx context.Context, k8sClient client.Client, namespace, name string, providerObj *v1beta1.Provider) (string, error) {
 	configuration, err := Get(ctx, k8sClient, apitypes.NamespacedName{Namespace: namespace, Name: name})
@@ -103,7 +83,7 @@ func Get(ctx context.Context, k8sClient client.Client, namespacedName apitypes.N
 // IsDeletable will check whether the Configuration can be deleted immediately
 // If deletable, it means
 // - no external cloud resources are provisioned
-//- it's in force-delete state
+// - it's in force-delete state
 func IsDeletable(ctx context.Context, k8sClient client.Client, configuration *v1beta2.Configuration) (bool, error) {
 	if configuration.Spec.ForceDelete != nil && *configuration.Spec.ForceDelete {
 		return true, nil

@@ -15,12 +15,12 @@ import (
 
 	"github.com/agiledragon/gomonkey/v2"
 	"github.com/aliyun/alibaba-cloud-sdk-go/services/sts"
-	"github.com/oam-dev/terraform-controller/controllers/configuration/backend"
+	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
-	kerrors "k8s.io/apimachinery/pkg/api/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -37,6 +37,7 @@ import (
 	crossplane "github.com/oam-dev/terraform-controller/api/types/crossplane-runtime"
 	"github.com/oam-dev/terraform-controller/api/v1beta1"
 	"github.com/oam-dev/terraform-controller/api/v1beta2"
+	"github.com/oam-dev/terraform-controller/controllers/configuration/backend"
 	"github.com/oam-dev/terraform-controller/controllers/provider"
 )
 
@@ -76,6 +77,7 @@ func TestInitTFConfigurationMeta(t *testing.T) {
 			},
 			want: &TFConfigurationMeta{
 				Namespace:           "default",
+				ControllerNamespace: "default",
 				Name:                "abc",
 				ConfigurationCMName: "tf-abc",
 				VariableSecretName:  "variable-abc",
@@ -94,6 +96,7 @@ func TestInitTFConfigurationMeta(t *testing.T) {
 			configuration: completeConfiguration,
 			want: &TFConfigurationMeta{
 				Namespace:           "default",
+				ControllerNamespace: "default",
 				Name:                "abc",
 				ConfigurationCMName: "tf-abc",
 				VariableSecretName:  "variable-abc",
@@ -111,7 +114,7 @@ func TestInitTFConfigurationMeta(t *testing.T) {
 
 	for _, tc := range testcases {
 		t.Run(tc.name, func(t *testing.T) {
-			meta := initTFConfigurationMeta(req, tc.configuration)
+			meta := initTFConfigurationMeta(req, tc.configuration, nil)
 			if !reflect.DeepEqual(meta.Name, tc.want.Name) {
 				t.Errorf("initTFConfigurationMeta = %v, want %v", meta, tc.want)
 			}
@@ -129,7 +132,7 @@ func TestInitTFConfigurationMetaWithDeleteResource(t *testing.T) {
 		meta          *TFConfigurationMeta
 	}{
 		{
-			name: "DeleteResource is false",
+			name: "DeleteResource is true",
 			configuration: v1beta2.Configuration{
 				ObjectMeta: v1.ObjectMeta{
 					Name: "abc",
@@ -143,7 +146,7 @@ func TestInitTFConfigurationMetaWithDeleteResource(t *testing.T) {
 			},
 		},
 		{
-			name: "DeleteResource is true",
+			name: "DeleteResource is false",
 			configuration: v1beta2.Configuration{
 				ObjectMeta: v1.ObjectMeta{
 					Name: "abc",
@@ -173,7 +176,7 @@ func TestInitTFConfigurationMetaWithDeleteResource(t *testing.T) {
 	}
 	for _, tc := range testcases {
 		t.Run(tc.name, func(t *testing.T) {
-			meta := initTFConfigurationMeta(req, tc.configuration)
+			meta := initTFConfigurationMeta(req, tc.configuration, nil)
 			if !reflect.DeepEqual(meta.DeleteResource, tc.meta.DeleteResource) {
 				t.Errorf("initTFConfigurationMeta = %v, want %v", meta, tc.meta)
 			}
@@ -194,8 +197,159 @@ func TestInitTFConfigurationMetaWithJobNodeSelector(t *testing.T) {
 		},
 		Spec: v1beta2.ConfigurationSpec{},
 	}
-	meta := initTFConfigurationMeta(req, configuration)
+	meta := initTFConfigurationMeta(req, configuration, nil)
 	assert.Equal(t, meta.JobNodeSelector, map[string]string{"ssd": "true"})
+}
+
+func TestPrepareTFVariables(t *testing.T) {
+	prjID := "PrjID"
+	prjIDValue := "test123"
+	testKey := "Test"
+	testValue := "abc123"
+	credentialKey := "key"
+	credentialValue := "testkey"
+	variable, _ := json.Marshal(map[string]interface{}{
+		testKey: testValue,
+	})
+	configuration := v1beta2.Configuration{
+		ObjectMeta: v1.ObjectMeta{
+			Namespace: "default",
+			Name:      "abc",
+		},
+		Spec: v1beta2.ConfigurationSpec{
+			ProviderReference: &crossplane.Reference{
+				Name:      "default",
+				Namespace: "default",
+			},
+			HCL: "test",
+			Variable: &runtime.RawExtension{
+				Raw: variable,
+			},
+		},
+	}
+	meta := &TFConfigurationMeta{
+		JobEnv: map[string]interface{}{
+			prjID: prjIDValue,
+		},
+		ProviderReference: &crossplane.Reference{
+			Name:      "default",
+			Namespace: "default",
+		},
+		Credentials: map[string]string{
+			credentialKey: credentialValue,
+		},
+	}
+	err := meta.prepareTFVariables(&configuration)
+	assert.Nil(t, err)
+	rTestKey := fmt.Sprintf("TF_VAR_%s", testKey)
+	wantVarSecretData := map[string]string{prjID: prjIDValue, rTestKey: testValue, credentialKey: credentialValue}
+	for k, v := range wantVarSecretData {
+		actualV, ok := meta.VariableSecretData[k]
+		assert.Equal(t, ok, true)
+		assert.Equal(t, actualV, []byte(v))
+	}
+	existMap := map[string]bool{}
+	for _, e := range meta.Envs {
+		switch e.Name {
+		case prjID:
+			existMap[prjID] = true
+		case rTestKey:
+			existMap[rTestKey] = true
+		case credentialKey:
+			existMap[credentialKey] = true
+		default:
+			t.Fatalf("unexpected %s", e.Name)
+		}
+	}
+	assert.Equal(t, len(existMap), 3)
+	for _, v := range existMap {
+		assert.Equal(t, v, true)
+	}
+}
+
+func TestInitTFConfigurationMetaWithJobEnv(t *testing.T) {
+	req := ctrl.Request{}
+	r := &ConfigurationReconciler{}
+	s := runtime.NewScheme()
+	v1beta1.AddToScheme(s)
+	v1beta2.AddToScheme(s)
+	corev1.AddToScheme(s)
+	req.Namespace = "default"
+	req.Name = "abc"
+	prjID := "PrjID"
+	prjIDValue := "abc"
+	data, _ := json.Marshal(map[string]interface{}{
+		prjID: prjIDValue,
+	})
+	ak := provider.AlibabaCloudCredentials{
+		AccessKeyID:     "aaaa",
+		AccessKeySecret: "bbbbb",
+	}
+	credentials, err := json.Marshal(&ak)
+	secret := corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "default",
+			Namespace: "default",
+		},
+		Data: map[string][]byte{
+			"credentials": credentials,
+		},
+		Type: corev1.SecretTypeOpaque,
+	}
+	provider := v1beta1.Provider{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "terraform.core.oam.dev/v1beta2",
+			Kind:       "Provider",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "default",
+			Namespace: "default",
+		},
+		Spec: v1beta1.ProviderSpec{
+			Provider: "ucloud",
+			Credentials: v1beta1.ProviderCredentials{
+				Source: crossplane.CredentialsSourceSecret,
+				SecretRef: &crossplane.SecretKeySelector{
+					SecretReference: crossplane.SecretReference{
+						Name:      "default",
+						Namespace: "default",
+					},
+					Key: "credentials",
+				},
+			},
+		},
+	}
+	configuration := v1beta2.Configuration{
+		ObjectMeta: v1.ObjectMeta{
+			Namespace: "default",
+			Name:      "abc",
+		},
+		Spec: v1beta2.ConfigurationSpec{
+			ProviderReference: &crossplane.Reference{
+				Name:      "default",
+				Namespace: "default",
+			},
+			JobEnv: &runtime.RawExtension{
+				Raw: data,
+			},
+			HCL: "test",
+		},
+	}
+	r.Client = fake.NewClientBuilder().WithScheme(s).WithObjects(&configuration, &provider, &secret).Build()
+	meta := initTFConfigurationMeta(req, configuration, r.Client)
+	err = r.preCheck(context.Background(), &configuration, meta)
+	assert.Nil(t, err)
+	assert.Equal(t, meta.JobEnv, map[string]interface{}{
+		prjID: prjIDValue,
+	})
+	assert.Equal(t, meta.VariableSecretData[prjID], []byte(prjIDValue))
+	envExist := false
+	for _, e := range meta.Envs {
+		if e.Name == prjID {
+			envExist = true
+		}
+	}
+	assert.Equal(t, envExist, true)
 }
 
 func TestCheckProvider(t *testing.T) {
@@ -478,6 +632,26 @@ func TestConfigurationReconcile(t *testing.T) {
 	r5 := &ConfigurationReconciler{}
 	r5.Client = fake.NewClientBuilder().WithScheme(s).WithObjects(secret, provider, configuration5, destroyJob5).Build()
 
+	// @step: create the setup for the job namespace tests
+	configuration6 := &v1beta2.Configuration{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "a",
+			Namespace:  "b",
+			Finalizers: []string{configurationFinalizer},
+			UID:        "12345",
+		},
+		Spec: v1beta2.ConfigurationSpec{
+			HCL: "c",
+		},
+	}
+
+	namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "builds"}}
+	r6 := &ConfigurationReconciler{ControllerNamespace: "builds"}
+	r6.Client = fake.NewClientBuilder().
+		WithScheme(s).
+		WithObjects(namespace, secret, provider, configuration6).
+		Build()
+
 	type args struct {
 		req reconcile.Request
 		r   *ConfigurationReconciler
@@ -488,9 +662,10 @@ func TestConfigurationReconcile(t *testing.T) {
 	}
 
 	testcases := []struct {
-		name string
-		args args
-		want want
+		name  string
+		args  args
+		want  want
+		check func(t *testing.T, cc client.Client)
 	}{
 		{
 			name: "Configuration is not found",
@@ -530,6 +705,20 @@ func TestConfigurationReconcile(t *testing.T) {
 				r:   r5,
 			},
 		},
+		{
+			name: "Builds should be run in the controller namespace when defined",
+			args: args{
+				req: req,
+				r:   r6,
+			},
+			check: func(t *testing.T, cc client.Client) {
+				job := &batchv1.Job{}
+				err := cc.Get(context.TODO(), k8stypes.NamespacedName{Name: "12345-apply", Namespace: "builds"}, job)
+				if err != nil {
+					t.Error("Failed to retrieve jobs from builds namespace")
+				}
+			},
+		},
 	}
 
 	for _, tc := range testcases {
@@ -539,6 +728,9 @@ func TestConfigurationReconcile(t *testing.T) {
 					!strings.Contains(err.Error(), tc.want.errMsg) {
 					t.Errorf("Reconcile() error = %v, wantErr %v", err, tc.want.errMsg)
 				}
+			}
+			if tc.check != nil {
+				tc.check(t, tc.args.r.Client)
 			}
 		})
 	}
@@ -1103,7 +1295,19 @@ func TestPreCheckWhenConfigurationIsChanged(t *testing.T) {
 }
 
 func TestTerraformDestroy(t *testing.T) {
-	r1 := &ConfigurationReconciler{}
+	const (
+		// secrets/configmaps are dispatched to this ns
+		controllerNamespace = "tf-controller-namespace"
+		legacyNamespace     = "legacy-namespace"
+		configurationCMName = "tf-config-cm"
+		secretSuffix        = "secret-suffix"
+		secretNS            = "default"
+		destroyJobName      = "destroy-job"
+		applyJobName        = "apply-job"
+
+		connectionSecretName = "conn"
+		connectionSecretNS   = "conn-ns"
+	)
 	ctx := context.Background()
 	s := runtime.NewScheme()
 	v1beta1.AddToScheme(s)
@@ -1111,104 +1315,107 @@ func TestTerraformDestroy(t *testing.T) {
 	corev1.AddToScheme(s)
 	batchv1.AddToScheme(s)
 	rbacv1.AddToScheme(s)
-	provider1 := &v1beta1.Provider{
+	// this is default provider if not specified in configuration.spec.providerRef
+	baseProvider := &v1beta1.Provider{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "default",
 			Namespace: "default",
 		},
-		Status: v1beta1.ProviderStatus{
-			State: types.ProviderIsNotReady,
-		},
 	}
-	k8sClient1 := fake.NewClientBuilder().WithScheme(s).WithObjects(provider1).Build()
-	r1.Client = k8sClient1
+	readyProvider := baseProvider.DeepCopy()
+	readyProvider.Status.State = types.ProviderIsReady
+	notReadyProvider := baseProvider.DeepCopy()
+	notReadyProvider.Status.State = types.ProviderIsNotReady
 
-	r2 := &ConfigurationReconciler{}
-	provider1.Status.State = types.ProviderIsReady
-	configuration := &v1beta2.Configuration{
+	baseApplyJob := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
-			Namespace: "default",
-			Name:      "b",
+			Name:      applyJobName,
+			Namespace: controllerNamespace,
 		},
 	}
-	k8sClient2 := fake.NewClientBuilder().WithScheme(s).WithObjects(provider1, configuration).Build()
-	r2.Client = k8sClient2
+	applyJobInLegacyNS := baseApplyJob.DeepCopy()
+	applyJobInLegacyNS.Namespace = legacyNamespace
 
-	r4 := &ConfigurationReconciler{}
-	provider1.Status.State = types.ProviderIsReady
-	job4 := &batchv1.Job{
+	baseDestroyJob := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "a",
-			Namespace: "default",
-		},
-		Status: batchv1.JobStatus{
-			Succeeded: int32(1),
+			Name:      destroyJobName,
+			Namespace: controllerNamespace,
 		},
 	}
-	data, _ := json.Marshal(map[string]interface{}{
-		"name": "abc",
-	})
-	variables := &runtime.RawExtension{Raw: data}
-	configuration4 := &v1beta2.Configuration{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: "default",
-			Name:      "b",
+	completeDestroyJob := baseDestroyJob.DeepCopy()
+	completeDestroyJob.Status.Succeeded = int32(1)
+
+	// Resources to be GC
+	baseConfigurationCM := &corev1.ConfigMap{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "ConfigMap",
+			APIVersion: "v1",
 		},
-		Spec: v1beta2.ConfigurationSpec{
-			Variable: variables,
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      configurationCMName,
+			Namespace: controllerNamespace,
 		},
 	}
-	configuration4.Spec.WriteConnectionSecretToReference = &crossplane.SecretReference{
-		Name:      "b",
+	baseVariableSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf(TFVariableSecret, secretSuffix),
+			Namespace: controllerNamespace,
+		},
+		Type: corev1.SecretTypeOpaque,
+	}
+	connectionSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      connectionSecretName,
+			Namespace: connectionSecretNS,
+		},
+		Type: corev1.SecretTypeOpaque,
+	}
+	ConfigurationCMInLegacyNS := baseConfigurationCM.DeepCopy()
+	ConfigurationCMInLegacyNS.Namespace = legacyNamespace
+	variableSecretInLegacyNS := baseVariableSecret.DeepCopy()
+	variableSecretInLegacyNS.Namespace = legacyNamespace
+
+	baseMeta := TFConfigurationMeta{
+		DestroyJobName:      destroyJobName,
+		ControllerNamespace: controllerNamespace,
+		ProviderReference: &crossplane.Reference{
+			Name:      baseProvider.Name,
+			Namespace: baseProvider.Namespace,
+		},
+		VariableSecretName:  fmt.Sprintf(TFVariableSecret, secretSuffix),
+		ConfigurationCMName: configurationCMName,
+		// True is default value if user ignores configuration.Spec.DeleteResource
+		DeleteResource: true,
+	}
+	metaWithLegacyResource := baseMeta
+	metaWithLegacyResource.LegacySubResources = LegacySubResources{
+		Namespace:           legacyNamespace,
+		ApplyJobName:        applyJobName,
+		DestroyJobName:      destroyJobName,
+		ConfigurationCMName: configurationCMName,
+		VariableSecretName:  fmt.Sprintf(TFVariableSecret, secretSuffix),
+	}
+
+	baseConfiguration := &v1beta2.Configuration{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "base-conf",
+			Namespace: "default",
+		},
+	}
+	configurationWithConnSecret := baseConfiguration.DeepCopy()
+	configurationWithConnSecret.Spec.WriteConnectionSecretToReference = &crossplane.SecretReference{
+		Name:      connectionSecretName,
+		Namespace: connectionSecretNS,
+	}
+	configurationPrdNotFound := baseConfiguration.DeepCopy()
+	configurationPrdNotFound.Spec.ProviderReference = &crossplane.Reference{
+		Name:      "not-exist",
 		Namespace: "default",
 	}
-	secret4 := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "b",
-			Namespace: "default",
-		},
-		Type: corev1.SecretTypeOpaque,
-	}
-	variableSecret4 := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "c",
-			Namespace: "default",
-		},
-		Type: corev1.SecretTypeOpaque,
-	}
-	k8sClient4 := fake.NewClientBuilder().WithScheme(s).WithObjects(provider1, job4, secret4, variableSecret4, configuration4).Build()
-	r4.Client = k8sClient4
-	meta4 := &TFConfigurationMeta{
-		DestroyJobName: "a",
-		Namespace:      "default",
-		DeleteResource: true,
-		ProviderReference: &crossplane.Reference{
-			Name:      "b",
-			Namespace: "default",
-		},
-		VariableSecretName: "c",
-		Backend: &backend.K8SBackend{
-			Client:       k8sClient4,
-			SecretSuffix: "a",
-			SecretNS:     "default",
-		},
-	}
-
-	r5 := &ConfigurationReconciler{}
-	forceDeleteConfig5 := &v1beta2.Configuration{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: "default",
-			Name:      "force-delete-config-5",
-		},
-		Spec: v1beta2.ConfigurationSpec{},
-	}
-	var forceDelete = true
-	forceDeleteConfig5.Spec.ForceDelete = &forceDelete
-	k8sClient5 := fake.NewClientBuilder().WithScheme(s).WithObjects(forceDeleteConfig5).Build()
-	r5.Client = k8sClient5
+	forceDeleteConfiguration := baseConfiguration.DeepCopy()
+	forceDeleteConfiguration.Spec.ForceDelete = pointer.Bool(true)
 
 	type args struct {
-		r             *ConfigurationReconciler
 		namespace     string
 		configuration *v1beta2.Configuration
 		meta          *TFConfigurationMeta
@@ -1216,64 +1423,109 @@ func TestTerraformDestroy(t *testing.T) {
 	type want struct {
 		errMsg string
 	}
-	testcases := []struct {
-		name string
-		args args
-		want want
+	var testcases = []struct {
+		name             string
+		args             args
+		want             want
+		objects          []client.Object
+		deletedResources []client.Object
+		keptResources    []client.Object
 	}{
 		{
-			name: "directly clean resources",
+			name: "dispatch destroy job, subresource not cleanup, job not completed",
 			args: args{
-				r:             r1,
-				configuration: &v1beta2.Configuration{},
-				meta: &TFConfigurationMeta{
-					ConfigurationCMName: "tf-abc",
-					Namespace:           "default",
-				},
-			},
-			want: want{},
-		},
-		{
-			name: "referenced provider is not available",
-			args: args{
-				r:             r2,
-				configuration: configuration,
-				meta: &TFConfigurationMeta{
-					ConfigurationCMName: "tf-abc",
-					Namespace:           "default",
-					DeleteResource:      true,
-				},
+				configuration: baseConfiguration,
+				meta:          &baseMeta,
 			},
 			want: want{
-				errMsg: "jobs.batch \"\" not found",
+				errMsg: types.MessageDestroyJobNotCompleted,
 			},
+			objects:       []client.Object{readyProvider, baseConfiguration, baseConfigurationCM},
+			keptResources: []client.Object{baseConfigurationCM},
 		},
 		{
-			name: "could not directly remove resources, and destroy job completes",
+			name: "provider is not ready, cloud resource couldn't be created, delete directly",
 			args: args{
-				r:             r4,
-				configuration: configuration4,
-				meta:          meta4,
+				configuration: baseConfiguration,
+				meta:          &baseMeta,
 			},
-			want: want{},
+			objects:          []client.Object{notReadyProvider, baseConfiguration, baseConfigurationCM},
+			deletedResources: []client.Object{baseConfigurationCM},
+			want:             want{},
+		},
+		{
+			name: "referenced provider not exist, allow to delete directly",
+			args: args{
+				configuration: configurationPrdNotFound,
+				meta:          &baseMeta,
+			},
+			objects:          []client.Object{readyProvider, baseConfiguration, baseConfigurationCM, baseVariableSecret},
+			want:             want{},
+			deletedResources: []client.Object{baseConfigurationCM, baseVariableSecret},
+		},
+		{
+			name: "destroy job has completes, cleanup resources",
+			args: args{
+				configuration: configurationWithConnSecret,
+				meta:          &baseMeta,
+			},
+			want:             want{},
+			objects:          []client.Object{readyProvider, configurationWithConnSecret, baseConfigurationCM, completeDestroyJob, baseVariableSecret, connectionSecret},
+			deletedResources: []client.Object{baseConfigurationCM, completeDestroyJob, baseVariableSecret, connectionSecret},
 		},
 		{
 			name: "force delete configuration",
 			args: args{
-				r:             r5,
-				configuration: forceDeleteConfig5,
-				meta:          &TFConfigurationMeta{},
+				configuration: forceDeleteConfiguration,
+				meta:          &baseMeta,
 			},
+			objects:          []client.Object{readyProvider, forceDeleteConfiguration, baseConfigurationCM, completeDestroyJob, baseVariableSecret},
+			deletedResources: []client.Object{baseConfigurationCM, completeDestroyJob, baseVariableSecret},
+		},
+		{
+			name: "compatible to clean up resources when upgrade controller with --controller-namespace",
+			args: args{
+				configuration: baseConfiguration,
+				meta:          &metaWithLegacyResource,
+			},
+			objects:          []client.Object{baseConfiguration, variableSecretInLegacyNS, ConfigurationCMInLegacyNS, applyJobInLegacyNS},
+			deletedResources: []client.Object{variableSecretInLegacyNS, ConfigurationCMInLegacyNS, applyJobInLegacyNS},
+			want:             want{},
 		},
 	}
 	for _, tc := range testcases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := tc.args.r.terraformDestroy(ctx, tc.args.namespace, *tc.args.configuration, tc.args.meta)
-			if err != nil || tc.want.errMsg != "" {
-				if !strings.Contains(err.Error(), tc.want.errMsg) {
-					t.Errorf("terraformDestroy() error = %v, wantErr %v", err, tc.want.errMsg)
-					return
+			// Prepare for test. 1. Build reconciler with fake client
+			k8sClient := fake.NewClientBuilder().WithScheme(s).WithObjects(tc.objects...).Build()
+			reconciler := &ConfigurationReconciler{
+				Client: k8sClient,
+			}
+			// 2. Set meta backend
+			tc.args.meta.Backend = &backend.K8SBackend{
+				Client:       k8sClient,
+				SecretSuffix: secretSuffix,
+				SecretNS:     secretNS,
+			}
+
+			err := reconciler.terraformDestroy(ctx, *tc.args.configuration, tc.args.meta)
+			if tc.want.errMsg != "" {
+				if err == nil {
+					t.Errorf("expected error: %s, got nil", tc.want.errMsg)
+				} else if !strings.Contains(err.Error(), tc.want.errMsg) {
+					t.Errorf("expected error containing %q, got %q", tc.want.errMsg, err.Error())
 				}
+			} else {
+				if err != nil {
+					t.Errorf("unexpected error: %v", err)
+				}
+			}
+			for _, rsc := range tc.keptResources {
+				err = k8sClient.Get(ctx, client.ObjectKey{Namespace: rsc.GetNamespace(), Name: rsc.GetName()}, rsc)
+				assert.NoError(t, err, "resource should be kept %s/%s", rsc.GetNamespace(), rsc.GetName())
+			}
+			for _, rsc := range tc.deletedResources {
+				err = k8sClient.Get(ctx, client.ObjectKey{Namespace: rsc.GetNamespace(), Name: rsc.GetName()}, rsc)
+				assert.True(t, apierrors.IsNotFound(err), "resource %s/%s should be deleted", rsc.GetNamespace(), rsc.GetName())
 			}
 		})
 	}
@@ -1326,14 +1578,16 @@ func TestAssembleTerraformJobWithResourcesSetting(t *testing.T) {
 		TerraformImage:      "f",
 		RemoteGit:           "g",
 
-		ResourcesLimitsCPU:              "10m",
-		ResourcesLimitsCPUQuantity:      quantityLimitsCPU,
-		ResourcesLimitsMemory:           "10Mi",
-		ResourcesLimitsMemoryQuantity:   quantityLimitsMemory,
-		ResourcesRequestsCPU:            "100m",
-		ResourcesRequestsCPUQuantity:    quantityRequestsCPU,
-		ResourcesRequestsMemory:         "5Gi",
-		ResourcesRequestsMemoryQuantity: quantityRequestsMemory,
+		ResourceQuota: ResourceQuota{
+			ResourcesLimitsCPU:              "10m",
+			ResourcesLimitsCPUQuantity:      quantityLimitsCPU,
+			ResourcesLimitsMemory:           "10Mi",
+			ResourcesLimitsMemoryQuantity:   quantityLimitsMemory,
+			ResourcesRequestsCPU:            "100m",
+			ResourcesRequestsCPUQuantity:    quantityRequestsCPU,
+			ResourcesRequestsMemory:         "5Gi",
+			ResourcesRequestsMemoryQuantity: quantityRequestsMemory,
+		},
 	}
 
 	job := meta.assembleTerraformJob(TerraformApply)
@@ -1876,7 +2130,7 @@ func TestAssembleAndTriggerJob(t *testing.T) {
 	}
 
 	patches := gomonkey.ApplyFunc(apiutil.GVKForObject, func(obj runtime.Object, scheme *runtime.Scheme) (schema.GroupVersionKind, error) {
-		return schema.GroupVersionKind{}, kerrors.NewNotFound(schema.GroupResource{}, "")
+		return schema.GroupVersionKind{}, apierrors.NewNotFound(schema.GroupResource{}, "")
 	})
 	defer patches.Reset()
 
@@ -1935,6 +2189,7 @@ func TestCheckWhetherConfigurationChanges(t *testing.T) {
 				meta: &TFConfigurationMeta{
 					ConfigurationCMName: "a",
 					Namespace:           "b",
+					ControllerNamespace: "b",
 				},
 				configurationType: "xxx",
 			},
@@ -1947,6 +2202,7 @@ func TestCheckWhetherConfigurationChanges(t *testing.T) {
 				meta: &TFConfigurationMeta{
 					ConfigurationCMName: "aaa",
 					Namespace:           "b",
+					ControllerNamespace: "b",
 				},
 				configurationType: "xxx",
 			},
@@ -1962,6 +2218,281 @@ func TestCheckWhetherConfigurationChanges(t *testing.T) {
 				if !strings.Contains(err.Error(), tc.want.errMsg) {
 					t.Errorf("CheckWhetherConfigurationChanges() error = %v, wantErr %v", err, tc.want.errMsg)
 				}
+			}
+		})
+	}
+}
+
+func TestGetApplyJob(t *testing.T) {
+	const (
+		applyJobNameWithUID = "xxxx-xxxx-xxxx"
+		controllerNamespace = "ctrl-ns"
+		applyJobName        = "configuraion-apply"
+		jobNamespace        = "configuration-ns"
+		//legacyApplyJobName  = "legacy-job-name"
+		//legacyJobNamespace  = "legacy-job-ns"
+	)
+
+	ctx := context.Background()
+	s := runtime.NewScheme()
+	v1beta1.AddToScheme(s)
+	v1beta2.AddToScheme(s)
+	batchv1.AddToScheme(s)
+	baseMeta := TFConfigurationMeta{
+		ApplyJobName:        applyJobName,
+		ControllerNamespace: jobNamespace,
+	}
+	baseJob := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      applyJobName,
+			Namespace: jobNamespace,
+		},
+	}
+	jobInCtrlNS := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      applyJobNameWithUID,
+			Namespace: controllerNamespace,
+		},
+	}
+	legacyJob := baseJob.DeepCopy()
+
+	testCases := []struct {
+		name string
+
+		objects []client.Object
+		wantErr error
+		meta    TFConfigurationMeta
+	}{
+		{
+			name:    "get job successfully",
+			objects: []client.Object{baseJob},
+			meta:    baseMeta,
+		},
+		{name: "get legacy job successfully",
+			objects: []client.Object{legacyJob},
+			meta: TFConfigurationMeta{LegacySubResources: LegacySubResources{
+				Namespace:    jobNamespace,
+				ApplyJobName: applyJobName,
+			}},
+		},
+		{
+			name:    "get job in controller namespace",
+			objects: []client.Object{jobInCtrlNS},
+			meta: TFConfigurationMeta{
+				ControllerNamespace: controllerNamespace,
+				ApplyJobName:        applyJobNameWithUID,
+			},
+		},
+		{
+			name:    "not get any job",
+			objects: []client.Object{},
+			meta: TFConfigurationMeta{
+				ControllerNamespace: controllerNamespace,
+				ApplyJobName:        applyJobNameWithUID,
+				LegacySubResources: LegacySubResources{
+					Namespace:    jobNamespace,
+					ApplyJobName: applyJobName,
+				},
+			},
+			wantErr: errors.New("not found"),
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			var job batchv1.Job
+			k8sClient := fake.NewClientBuilder().WithScheme(s).WithObjects(tc.objects...).Build()
+
+			err := tc.meta.getApplyJob(ctx, k8sClient, &job)
+			if tc.wantErr != nil {
+				if err == nil {
+					t.Errorf("expected error: %s, got nil", tc.wantErr)
+				} else if !strings.Contains(err.Error(), tc.wantErr.Error()) {
+					t.Errorf("expected error containing %q, got %q", tc.wantErr, err.Error())
+				}
+			} else {
+				if err != nil {
+					t.Errorf("unexpected error: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestRenderConfiguration(t *testing.T) {
+	type args struct {
+		configuration         *v1beta2.Configuration
+		configurationType     types.ConfigurationType
+		credentials           map[string]string
+		controllerNSSpecified bool
+	}
+	type want struct {
+		cfg              string
+		backendInterface backend.Backend
+		errMsg           string
+	}
+
+	k8sClient := fake.NewClientBuilder().Build()
+	baseMeta := TFConfigurationMeta{
+		K8sClient: k8sClient,
+	}
+
+	testcases := []struct {
+		name string
+		args args
+		want want
+	}{
+		{
+			name: "backend is not nil, configuration is hcl",
+			args: args{
+				configuration: &v1beta2.Configuration{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "n1",
+					},
+					Spec: v1beta2.ConfigurationSpec{
+						Backend: &v1beta2.Backend{},
+						HCL:     "image_id=123",
+					},
+				},
+				configurationType: types.ConfigurationHCL,
+			},
+			want: want{
+				cfg: `image_id=123
+
+terraform {
+  backend "kubernetes" {
+    secret_suffix     = ""
+    in_cluster_config = true
+    namespace         = "n1"
+  }
+}
+`,
+				backendInterface: &backend.K8SBackend{
+					Client: k8sClient,
+					HCLCode: `
+terraform {
+  backend "kubernetes" {
+    secret_suffix     = ""
+    in_cluster_config = true
+    namespace         = "n1"
+  }
+}
+`,
+					SecretSuffix: "",
+					SecretNS:     "n1",
+				},
+			},
+		},
+		{
+			name: "backend is nil, configuration is remote",
+			args: args{
+				configuration: &v1beta2.Configuration{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "n2",
+					},
+					Spec: v1beta2.ConfigurationSpec{
+						Remote: "https://github.com/a/b.git",
+					},
+				},
+				configurationType: types.ConfigurationRemote,
+			},
+			want: want{
+				cfg: `
+terraform {
+  backend "kubernetes" {
+    secret_suffix     = ""
+    in_cluster_config = true
+    namespace         = "n2"
+  }
+}
+`,
+				backendInterface: &backend.K8SBackend{
+					Client: k8sClient,
+					HCLCode: `
+terraform {
+  backend "kubernetes" {
+    secret_suffix     = ""
+    in_cluster_config = true
+    namespace         = "n2"
+  }
+}
+`,
+					SecretSuffix: "",
+					SecretNS:     "n2",
+				},
+			},
+		},
+		{
+			name: "backend is nil, configuration is not supported",
+			args: args{
+				configuration: &v1beta2.Configuration{
+					Spec: v1beta2.ConfigurationSpec{},
+				},
+			},
+			want: want{
+				errMsg: "Unsupported Configuration Type",
+			},
+		},
+		{
+			name: "controller-namespace specified, backend should have legacy secret suffix",
+			args: args{
+				configuration: &v1beta2.Configuration{
+					Spec: v1beta2.ConfigurationSpec{
+						Backend: nil,
+					},
+					ObjectMeta: metav1.ObjectMeta{
+						UID:       "xxxx-xxxx",
+						Namespace: "n2",
+						Name:      "name",
+					},
+				},
+				controllerNSSpecified: true,
+				configurationType:     types.ConfigurationRemote,
+			},
+			want: want{
+				cfg: `
+terraform {
+  backend "kubernetes" {
+    secret_suffix     = "xxxx-xxxx"
+    in_cluster_config = true
+    namespace         = "n2"
+  }
+}
+`,
+				backendInterface: &backend.K8SBackend{
+					Client: k8sClient,
+					HCLCode: `
+terraform {
+  backend "kubernetes" {
+    secret_suffix     = "xxxx-xxxx"
+    in_cluster_config = true
+    namespace         = "n2"
+  }
+}
+`,
+					SecretSuffix:       "xxxx-xxxx",
+					SecretNS:           "n2",
+					LegacySecretSuffix: "name",
+				}},
+		},
+	}
+
+	for _, tc := range testcases {
+		t.Run(tc.name, func(t *testing.T) {
+			meta := baseMeta
+			meta.ControllerNSSpecified = tc.args.controllerNSSpecified
+			got, backendConf, err := meta.RenderConfiguration(tc.args.configuration, tc.args.configurationType)
+			if tc.want.errMsg != "" && !strings.Contains(err.Error(), tc.want.errMsg) {
+				t.Errorf("ValidConfigurationObject() error = %v, wantErr %v", err, tc.want.errMsg)
+				return
+			}
+			if tc.want.errMsg == "" && err != nil {
+				t.Errorf("ValidConfigurationObject() error = %v, wantErr nil", err)
+				return
+			}
+			assert.Equal(t, tc.want.cfg, got)
+
+			if !reflect.DeepEqual(tc.want.backendInterface, backendConf) {
+				t.Errorf("backendInterface is not equal.\n got %#v\n, want %#v", backendConf, tc.want.backendInterface)
 			}
 		})
 	}
